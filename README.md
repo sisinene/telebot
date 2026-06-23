@@ -32,7 +32,7 @@ Put the newly rotated credentials in `.env`, save it, then start the bot. Keep t
 - `TELEGRAM_BOT_TOKEN`: Telegram token from @BotFather (required)
 - `GROQ_API_KEY`: Groq API key (required)
 - `GROQ_MODEL`: model ID; defaults to `llama-3.3-70b-versatile`
-- `SYSTEM_PROMPT`: controls the assistant's behavior
+- `SYSTEM_PROMPT`: controls the assistant's behavior; by default it is warm, concise, memory-aware, Telegram-friendly, and keeps hidden reasoning private
 - `MEMORY_DB_PATH`: SQLite file path; defaults to `bot_memory.sqlite3`
 - `RECENT_MEMORY_MESSAGES`: recent messages always included in context; defaults to `30`
 - `RELEVANT_MEMORY_MESSAGES`: older matching messages retrieved from long-term memory; defaults to `12`

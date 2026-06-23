@@ -4,6 +4,7 @@ from pathlib import Path
 
 import bot
 from bot import (
+    DEFAULT_SYSTEM_PROMPT,
     active_reasoning_chains,
     build_chain_messages,
     build_memory_context,
@@ -29,6 +30,14 @@ class SplitMessageTests(unittest.TestCase):
 
     def test_empty_message_has_fallback(self) -> None:
         self.assertEqual(split_message(""), ["I couldn't produce a response."])
+
+
+class SystemPromptTests(unittest.TestCase):
+    def test_default_system_prompt_is_structured_and_memory_aware(self) -> None:
+        self.assertIn("Telegram", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("saved conversation memory", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("Do not expose hidden reasoning", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("Respect privacy and safety", DEFAULT_SYSTEM_PROMPT)
 
 
 class MemoryTests(unittest.TestCase):
