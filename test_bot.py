@@ -1,12 +1,14 @@
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import bot
 from bot import (
     DEFAULT_SYSTEM_PROMPT,
     active_reasoning_chains,
     build_chain_messages,
+    build_ground_check_messages,
     build_memory_context,
     build_synthesis_messages,
     clear_memory,
@@ -16,6 +18,7 @@ from bot import (
     init_memory_db,
     save_memory,
     split_message,
+    ground_check_answer,
 )
 
 
@@ -141,6 +144,44 @@ class ReasoningTests(unittest.TestCase):
         self.assertIn("Do not mention candidates", synthesis_messages[-2]["content"])
         self.assertIn("Candidate 1:", synthesis_messages[-1]["content"])
         self.assertIn("Answer B", synthesis_messages[-1]["content"])
+
+
+class GroundingTests(unittest.IsolatedAsyncioTestCase):
+    def test_ground_check_prompt_corrects_unsupported_claims(self) -> None:
+        messages = [{"role": "user", "content": "What is the current price?"}]
+
+        ground_messages = build_ground_check_messages(messages, "It is definitely $10.")
+
+        self.assertEqual(ground_messages[0], messages[0])
+        self.assertIn("Grounding check", ground_messages[-2]["content"])
+        self.assertIn("Remove or soften unsupported claims", ground_messages[-2]["content"])
+        self.assertIn("time-sensitive", ground_messages[-2]["content"])
+        self.assertIn("It is definitely $10.", ground_messages[-1]["content"])
+
+    async def test_ground_check_can_be_disabled(self) -> None:
+        original_enabled = bot.GROUND_CHECK_ENABLED
+        try:
+            bot.GROUND_CHECK_ENABLED = False
+            with patch("bot.call_groq", new_callable=AsyncMock) as mock_call:
+                answer = await ground_check_answer([], "draft")
+
+            self.assertEqual(answer, "draft")
+            mock_call.assert_not_called()
+        finally:
+            bot.GROUND_CHECK_ENABLED = original_enabled
+
+    async def test_ground_check_calls_groq_when_enabled(self) -> None:
+        original_enabled = bot.GROUND_CHECK_ENABLED
+        try:
+            bot.GROUND_CHECK_ENABLED = True
+            with patch("bot.call_groq", new_callable=AsyncMock) as mock_call:
+                mock_call.return_value = "grounded"
+                answer = await ground_check_answer([], "draft")
+
+            self.assertEqual(answer, "grounded")
+            mock_call.assert_awaited_once()
+        finally:
+            bot.GROUND_CHECK_ENABLED = original_enabled
 
 
 if __name__ == "__main__":

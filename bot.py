@@ -57,6 +57,13 @@ REASONING_CHAINS = int(os.getenv("REASONING_CHAINS", "3"))
 MAX_REASONING_CHAINS = int(os.getenv("MAX_REASONING_CHAINS", "5"))
 REASONING_DRAFT_TOKENS = int(os.getenv("REASONING_DRAFT_TOKENS", "900"))
 REASONING_FINAL_TOKENS = int(os.getenv("REASONING_FINAL_TOKENS", "1500"))
+GROUND_CHECK_ENABLED = os.getenv("GROUND_CHECK_ENABLED", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+GROUND_CHECK_TOKENS = int(os.getenv("GROUND_CHECK_TOKENS", "1200"))
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -338,6 +345,31 @@ def build_synthesis_messages(
     ]
 
 
+def build_ground_check_messages(
+    messages: Sequence[dict[str, str]],
+    draft_answer: str,
+) -> list[dict[str, str]]:
+    return [
+        *messages,
+        {
+            "role": "system",
+            "content": (
+                "Grounding check: audit the draft answer against only the visible conversation, "
+                "saved memory context, and general knowledge you can responsibly rely on. "
+                "Remove or soften unsupported claims. If facts may be current, local, legal, "
+                "medical, financial, or otherwise time-sensitive and no verified source is present, "
+                "say verification is needed instead of pretending certainty. Preserve useful, "
+                "well-supported content. Return only the corrected final Telegram reply. "
+                "Do not mention this grounding check."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Draft answer to ground-check and correct:\n\n{draft_answer}",
+        },
+    ]
+
+
 async def call_groq(
     messages: Sequence[dict[str, str]],
     *,
@@ -365,14 +397,25 @@ async def call_groq(
     return data["choices"][0]["message"]["content"].strip()
 
 
+async def ground_check_answer(messages: Sequence[dict[str, str]], draft_answer: str) -> str:
+    if not GROUND_CHECK_ENABLED:
+        return draft_answer
+    return await call_groq(
+        build_ground_check_messages(messages, draft_answer),
+        temperature=0.2,
+        max_completion_tokens=GROUND_CHECK_TOKENS,
+    )
+
+
 async def ask_groq(messages: Sequence[dict[str, str]]) -> str:
     chains = active_reasoning_chains()
     if chains == 1:
-        return await call_groq(
+        draft_answer = await call_groq(
             messages,
             temperature=0.7,
             max_completion_tokens=REASONING_FINAL_TOKENS,
         )
+        return await ground_check_answer(messages, draft_answer)
 
     draft_tasks = [
         call_groq(
@@ -383,11 +426,12 @@ async def ask_groq(messages: Sequence[dict[str, str]]) -> str:
         for chain_index in range(1, chains + 1)
     ]
     candidate_answers = await asyncio.gather(*draft_tasks)
-    return await call_groq(
+    synthesized_answer = await call_groq(
         build_synthesis_messages(messages, candidate_answers),
         temperature=0.35,
         max_completion_tokens=REASONING_FINAL_TOKENS,
     )
+    return await ground_check_answer(messages, synthesized_answer)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -396,7 +440,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Hi! Send me a message and I'll answer with AI. I keep long-term memory "
             "for this chat, so I can remember earlier conversations after restarts.\n\n"
             "Commands:\n/reset - clear saved memory\n/memory - show saved memory count\n"
-            "/reasoning - show reasoning mode\n/help - show help"
+            "/reasoning - show reasoning mode\n/grounding - show ground-check mode\n/help - show help"
         )
 
 
@@ -411,7 +455,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "Just send a text message. I save our conversation in long-term memory and "
             "use recent plus relevant older messages when answering. For harder replies, "
-            "I create multiple private answer drafts and synthesize one final response. "
+            "I create multiple private answer drafts, synthesize one final response, "
+            "and run a grounding pass to reduce unsupported claims. "
             "Use /memory to see how many messages are saved, or /reset to delete your saved memory."
         )
 
@@ -431,6 +476,17 @@ async def reasoning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text(
                 f"Reasoning mode: {chains} private answer drafts, then one synthesized final reply."
             )
+
+
+async def grounding_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        if GROUND_CHECK_ENABLED:
+            await update.message.reply_text(
+                "Grounding mode: enabled. I run a final pass to reduce unsupported claims "
+                "and mark uncertainty when facts may need verification."
+            )
+        else:
+            await update.message.reply_text("Grounding mode: disabled.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -477,13 +533,15 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("reasoning", reasoning_command))
+    app.add_handler(CommandHandler("grounding", grounding_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     logger.info(
-        "Bot started with model %s, memory database %s, and %s reasoning chain(s)",
+        "Bot started with model %s, memory database %s, %s reasoning chain(s), and ground check %s",
         GROQ_MODEL,
         MEMORY_DB_PATH,
         active_reasoning_chains(),
+        "enabled" if GROUND_CHECK_ENABLED else "disabled",
     )
     app.run_polling(drop_pending_updates=True)
 

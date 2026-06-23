@@ -1,6 +1,6 @@
 # Telegram AI Bot
 
-A lightweight Telegram chatbot backed by Groq. It stores long-term conversation memory in SQLite for each Telegram chat/user, uses multi-chain reasoning for stronger replies, and supports `/start`, `/help`, `/memory`, `/reasoning`, and `/reset`.
+A lightweight Telegram chatbot backed by Groq. It stores long-term conversation memory in SQLite for each Telegram chat/user, uses multi-chain reasoning plus a final ground-check pass for stronger replies, and supports `/start`, `/help`, `/memory`, `/reasoning`, `/grounding`, and `/reset`.
 
 ## Security first
 
@@ -41,6 +41,8 @@ Put the newly rotated credentials in `.env`, save it, then start the bot. Keep t
 - `MAX_REASONING_CHAINS`: safety cap for `REASONING_CHAINS`; defaults to `5`
 - `REASONING_DRAFT_TOKENS`: token budget for each private draft; defaults to `900`
 - `REASONING_FINAL_TOKENS`: token budget for the final synthesized answer; defaults to `1500`
+- `GROUND_CHECK_ENABLED`: runs a final groundedness pass before replying; defaults to `true`
+- `GROUND_CHECK_TOKENS`: token budget for the grounding pass; defaults to `1200`
 
 If Groq retires the default model, replace `GROQ_MODEL` with a model currently enabled for your Groq account.
 
@@ -58,6 +60,12 @@ This lets the bot remember earlier conversations across restarts without sending
 By default, the bot creates three private answer drafts with slightly different reasoning perspectives, then asks Groq to synthesize one final Telegram reply. The drafts are not sent to the user or saved as separate chat messages. This improves hard-answer quality while keeping the chat clean.
 
 Use `/reasoning` to see the active mode. Set `REASONING_CHAINS=1` if you want faster, cheaper single-pass replies.
+
+## Ground-check pass
+
+After the normal answer is drafted, the bot runs one final pass that checks the answer against the visible conversation, retrieved memory, and responsibly usable general knowledge. It rewrites the reply if it sounds too certain, relies on weak memory, or makes current/time-sensitive claims without verification.
+
+Use `/grounding` to see whether this pass is enabled. Set `GROUND_CHECK_ENABLED=false` if you want fewer API calls and faster replies.
 
 ## Deploy
 
