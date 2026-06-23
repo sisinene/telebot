@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import sqlite3
+import asyncio
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
@@ -32,6 +33,10 @@ MEMORY_DB_PATH = Path(os.getenv("MEMORY_DB_PATH", "bot_memory.sqlite3")).expandu
 RECENT_MEMORY_MESSAGES = int(os.getenv("RECENT_MEMORY_MESSAGES", "30"))
 RELEVANT_MEMORY_MESSAGES = int(os.getenv("RELEVANT_MEMORY_MESSAGES", "12"))
 MEMORY_CONTEXT_CHAR_LIMIT = int(os.getenv("MEMORY_CONTEXT_CHAR_LIMIT", "12000"))
+REASONING_CHAINS = int(os.getenv("REASONING_CHAINS", "3"))
+MAX_REASONING_CHAINS = int(os.getenv("MAX_REASONING_CHAINS", "5"))
+REASONING_DRAFT_TOKENS = int(os.getenv("REASONING_DRAFT_TOKENS", "900"))
+REASONING_FINAL_TOKENS = int(os.getenv("REASONING_FINAL_TOKENS", "1500"))
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -262,12 +267,68 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     return chunks or ["I couldn't produce a response."]
 
 
-async def ask_groq(messages: Sequence[dict[str, str]]) -> str:
+def active_reasoning_chains() -> int:
+    """Clamp chain count so config mistakes do not create runaway API calls."""
+    return max(1, min(REASONING_CHAINS, MAX_REASONING_CHAINS))
+
+
+def build_chain_messages(messages: Sequence[dict[str, str]], chain_index: int) -> list[dict[str, str]]:
+    perspectives = [
+        "Focus on the most direct and practical answer.",
+        "Check assumptions, edge cases, and hidden constraints before answering.",
+        "Look for a simpler explanation or alternative approach.",
+        "Prioritize safety, privacy, and operational reliability.",
+        "Use the user's saved context and preferences where relevant.",
+    ]
+    perspective = perspectives[(chain_index - 1) % len(perspectives)]
+    return [
+        *messages,
+        {
+            "role": "system",
+            "content": (
+                f"Candidate reasoning chain {chain_index}: {perspective} "
+                "Think carefully, but do not reveal private reasoning or scratchpad. "
+                "Return only the best answer draft."
+            ),
+        },
+    ]
+
+
+def build_synthesis_messages(
+    messages: Sequence[dict[str, str]],
+    candidate_answers: Sequence[str],
+) -> list[dict[str, str]]:
+    candidate_block = "\n\n".join(
+        f"Candidate {index}:\n{answer}" for index, answer in enumerate(candidate_answers, start=1)
+    )
+    return [
+        *messages,
+        {
+            "role": "system",
+            "content": (
+                "Synthesize the candidate answers into one final Telegram reply. "
+                "Prefer correctness, clarity, and usefulness. Resolve conflicts silently. "
+                "Do not mention candidates, chains, hidden reasoning, or scratchpad."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Candidate answers to synthesize:\n\n{candidate_block}",
+        },
+    ]
+
+
+async def call_groq(
+    messages: Sequence[dict[str, str]],
+    *,
+    temperature: float,
+    max_completion_tokens: int,
+) -> str:
     payload = {
         "model": GROQ_MODEL,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *messages],
-        "temperature": 0.7,
-        "max_completion_tokens": 1500,
+        "temperature": temperature,
+        "max_completion_tokens": max_completion_tokens,
     }
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -284,12 +345,38 @@ async def ask_groq(messages: Sequence[dict[str, str]]) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
+async def ask_groq(messages: Sequence[dict[str, str]]) -> str:
+    chains = active_reasoning_chains()
+    if chains == 1:
+        return await call_groq(
+            messages,
+            temperature=0.7,
+            max_completion_tokens=REASONING_FINAL_TOKENS,
+        )
+
+    draft_tasks = [
+        call_groq(
+            build_chain_messages(messages, chain_index),
+            temperature=0.55 + (chain_index * 0.08),
+            max_completion_tokens=REASONING_DRAFT_TOKENS,
+        )
+        for chain_index in range(1, chains + 1)
+    ]
+    candidate_answers = await asyncio.gather(*draft_tasks)
+    return await call_groq(
+        build_synthesis_messages(messages, candidate_answers),
+        temperature=0.35,
+        max_completion_tokens=REASONING_FINAL_TOKENS,
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(
             "Hi! Send me a message and I'll answer with AI. I keep long-term memory "
             "for this chat, so I can remember earlier conversations after restarts.\n\n"
-            "Commands:\n/reset - clear saved memory\n/memory - show saved memory count\n/help - show help"
+            "Commands:\n/reset - clear saved memory\n/memory - show saved memory count\n"
+            "/reasoning - show reasoning mode\n/help - show help"
         )
 
 
@@ -303,7 +390,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.message:
         await update.message.reply_text(
             "Just send a text message. I save our conversation in long-term memory and "
-            "use recent plus relevant older messages when answering. "
+            "use recent plus relevant older messages when answering. For harder replies, "
+            "I create multiple private answer drafts and synthesize one final response. "
             "Use /memory to see how many messages are saved, or /reset to delete your saved memory."
         )
 
@@ -312,6 +400,17 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.effective_chat and update.effective_user and update.message:
         saved_messages = count_memory(update.effective_chat.id, update.effective_user.id)
         await update.message.reply_text(f"I have {saved_messages} saved messages for this chat.")
+
+
+async def reasoning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        chains = active_reasoning_chains()
+        if chains == 1:
+            await update.message.reply_text("Reasoning mode: single-pass replies.")
+        else:
+            await update.message.reply_text(
+                f"Reasoning mode: {chains} private answer drafts, then one synthesized final reply."
+            )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -357,9 +456,15 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("memory", memory_command))
+    app.add_handler(CommandHandler("reasoning", reasoning_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    logger.info("Bot started with model %s and memory database %s", GROQ_MODEL, MEMORY_DB_PATH)
+    logger.info(
+        "Bot started with model %s, memory database %s, and %s reasoning chain(s)",
+        GROQ_MODEL,
+        MEMORY_DB_PATH,
+        active_reasoning_chains(),
+    )
     app.run_polling(drop_pending_updates=True)
 
 

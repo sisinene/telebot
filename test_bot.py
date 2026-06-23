@@ -2,8 +2,12 @@ import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
+import bot
 from bot import (
+    active_reasoning_chains,
+    build_chain_messages,
     build_memory_context,
+    build_synthesis_messages,
     clear_memory,
     count_memory,
     get_recent_memory,
@@ -92,6 +96,42 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(context[0]["role"], "system")
             self.assertIn("Pixel", context[0]["content"])
             self.assertEqual(context[-1]["content"], "What is my cat named?")
+
+
+class ReasoningTests(unittest.TestCase):
+    def test_reasoning_chains_are_clamped(self) -> None:
+        original_chains = bot.REASONING_CHAINS
+        original_max = bot.MAX_REASONING_CHAINS
+        try:
+            bot.REASONING_CHAINS = 99
+            bot.MAX_REASONING_CHAINS = 5
+            self.assertEqual(active_reasoning_chains(), 5)
+
+            bot.REASONING_CHAINS = 0
+            self.assertEqual(active_reasoning_chains(), 1)
+        finally:
+            bot.REASONING_CHAINS = original_chains
+            bot.MAX_REASONING_CHAINS = original_max
+
+    def test_chain_prompt_keeps_reasoning_private(self) -> None:
+        messages = [{"role": "user", "content": "Solve this carefully"}]
+
+        chain_messages = build_chain_messages(messages, 1)
+
+        self.assertEqual(chain_messages[0], messages[0])
+        self.assertEqual(chain_messages[-1]["role"], "system")
+        self.assertIn("do not reveal private reasoning", chain_messages[-1]["content"])
+        self.assertIn("Return only the best answer draft", chain_messages[-1]["content"])
+
+    def test_synthesis_prompt_merges_candidates_without_exposing_chains(self) -> None:
+        messages = [{"role": "user", "content": "What should I do?"}]
+
+        synthesis_messages = build_synthesis_messages(messages, ["Answer A", "Answer B"])
+
+        self.assertEqual(synthesis_messages[0], messages[0])
+        self.assertIn("Do not mention candidates", synthesis_messages[-2]["content"])
+        self.assertIn("Candidate 1:", synthesis_messages[-1]["content"])
+        self.assertIn("Answer B", synthesis_messages[-1]["content"])
 
 
 if __name__ == "__main__":

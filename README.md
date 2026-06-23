@@ -1,6 +1,6 @@
 # Telegram AI Bot
 
-A lightweight Telegram chatbot backed by Groq. It stores long-term conversation memory in SQLite for each Telegram chat/user and supports `/start`, `/help`, `/memory`, and `/reset`.
+A lightweight Telegram chatbot backed by Groq. It stores long-term conversation memory in SQLite for each Telegram chat/user, uses multi-chain reasoning for stronger replies, and supports `/start`, `/help`, `/memory`, `/reasoning`, and `/reset`.
 
 ## Security first
 
@@ -37,6 +37,10 @@ Put the newly rotated credentials in `.env`, save it, then start the bot. Keep t
 - `RECENT_MEMORY_MESSAGES`: recent messages always included in context; defaults to `30`
 - `RELEVANT_MEMORY_MESSAGES`: older matching messages retrieved from long-term memory; defaults to `12`
 - `MEMORY_CONTEXT_CHAR_LIMIT`: rough character budget for memory passed to the model; defaults to `12000`
+- `REASONING_CHAINS`: private answer drafts to generate before synthesis; defaults to `3`
+- `MAX_REASONING_CHAINS`: safety cap for `REASONING_CHAINS`; defaults to `5`
+- `REASONING_DRAFT_TOKENS`: token budget for each private draft; defaults to `900`
+- `REASONING_FINAL_TOKENS`: token budget for the final synthesized answer; defaults to `1500`
 
 If Groq retires the default model, replace `GROQ_MODEL` with a model currently enabled for your Groq account.
 
@@ -48,6 +52,12 @@ Every text message from the user and every bot answer is saved to SQLite. On eac
 2. relevant older messages found in long-term memory.
 
 This lets the bot remember earlier conversations across restarts without sending the entire database on every request. Use `/memory` to see how many messages are saved for the current chat/user. Use `/reset` to delete saved memory for the current chat/user.
+
+## Multi-chain reasoning
+
+By default, the bot creates three private answer drafts with slightly different reasoning perspectives, then asks Groq to synthesize one final Telegram reply. The drafts are not sent to the user or saved as separate chat messages. This improves hard-answer quality while keeping the chat clean.
+
+Use `/reasoning` to see the active mode. Set `REASONING_CHAINS=1` if you want faster, cheaper single-pass replies.
 
 ## Deploy
 
