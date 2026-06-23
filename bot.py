@@ -1,6 +1,10 @@
 import logging
 import os
+import re
+import sqlite3
 from collections.abc import Sequence
+from contextlib import closing
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -23,14 +27,211 @@ SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "You are a helpful, concise AI assistant in a Telegram chat.",
 ).strip()
-MAX_HISTORY_MESSAGES = 20
 TELEGRAM_MESSAGE_LIMIT = 4000
+MEMORY_DB_PATH = Path(os.getenv("MEMORY_DB_PATH", "bot_memory.sqlite3")).expanduser()
+RECENT_MEMORY_MESSAGES = int(os.getenv("RECENT_MEMORY_MESSAGES", "30"))
+RELEVANT_MEMORY_MESSAGES = int(os.getenv("RELEVANT_MEMORY_MESSAGES", "12"))
+MEMORY_CONTEXT_CHAR_LIMIT = int(os.getenv("MEMORY_CONTEXT_CHAR_LIMIT", "12000"))
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+def _memory_db_path(db_path: Path | str = MEMORY_DB_PATH) -> Path:
+    return Path(db_path).expanduser()
+
+
+def init_memory_db(db_path: Path | str = MEMORY_DB_PATH) -> None:
+    path = _memory_db_path(db_path)
+    if path.parent != Path("."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_chat_user_id
+            ON messages (chat_id, user_id, id)
+            """
+        )
+
+
+def save_memory(
+    chat_id: int,
+    user_id: int,
+    role: str,
+    content: str,
+    db_path: Path | str = MEMORY_DB_PATH,
+) -> None:
+    with closing(sqlite3.connect(_memory_db_path(db_path))) as conn, conn:
+        conn.execute(
+            """
+            INSERT INTO messages (chat_id, user_id, role, content)
+            VALUES (?, ?, ?, ?)
+            """,
+            (chat_id, user_id, role, content),
+        )
+
+
+def clear_memory(chat_id: int, user_id: int, db_path: Path | str = MEMORY_DB_PATH) -> int:
+    with closing(sqlite3.connect(_memory_db_path(db_path))) as conn, conn:
+        cursor = conn.execute(
+            "DELETE FROM messages WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id),
+        )
+        return cursor.rowcount
+
+
+def count_memory(chat_id: int, user_id: int, db_path: Path | str = MEMORY_DB_PATH) -> int:
+    with closing(sqlite3.connect(_memory_db_path(db_path))) as conn:
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id),
+        )
+        return int(cursor.fetchone()[0])
+
+
+def get_recent_memory(
+    chat_id: int,
+    user_id: int,
+    limit: int = RECENT_MEMORY_MESSAGES,
+    db_path: Path | str = MEMORY_DB_PATH,
+) -> list[dict[str, str | int]]:
+    with closing(sqlite3.connect(_memory_db_path(db_path))) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, role, content
+            FROM messages
+            WHERE chat_id = ? AND user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, user_id, limit),
+        ).fetchall()
+    return [
+        {"id": row["id"], "role": row["role"], "content": row["content"]}
+        for row in reversed(rows)
+    ]
+
+
+def _keywords(text: str) -> list[str]:
+    seen: set[str] = set()
+    words: list[str] = []
+    for word in re.findall(r"[A-Za-z0-9_]{3,}", text.lower()):
+        if word not in seen:
+            seen.add(word)
+            words.append(word)
+    return words[:10]
+
+
+def get_relevant_memory(
+    chat_id: int,
+    user_id: int,
+    query: str,
+    excluded_ids: set[int] | None = None,
+    limit: int = RELEVANT_MEMORY_MESSAGES,
+    db_path: Path | str = MEMORY_DB_PATH,
+) -> list[dict[str, str | int]]:
+    words = _keywords(query)
+    if not words:
+        return []
+
+    clauses = " OR ".join("LOWER(content) LIKE ?" for _ in words)
+    params: list[object] = [chat_id, user_id, *(f"%{word}%" for word in words)]
+    with closing(sqlite3.connect(_memory_db_path(db_path))) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT id, role, content
+            FROM messages
+            WHERE chat_id = ? AND user_id = ? AND ({clauses})
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            [*params, limit * 5],
+        ).fetchall()
+
+    excluded_ids = excluded_ids or set()
+    scored: list[tuple[int, int, sqlite3.Row]] = []
+    for row in rows:
+        if row["id"] in excluded_ids:
+            continue
+        content = row["content"].lower()
+        score = sum(1 for word in words if word in content)
+        scored.append((score, row["id"], row))
+
+    best_rows = [row for _, _, row in sorted(scored, reverse=True)[:limit]]
+    best_rows.sort(key=lambda row: row["id"])
+    return [
+        {"id": row["id"], "role": row["role"], "content": row["content"]}
+        for row in best_rows
+    ]
+
+
+def trim_memory_context(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    kept: list[dict[str, str]] = []
+    used_chars = 0
+    for message in reversed(messages):
+        message_chars = len(message["content"])
+        if kept and used_chars + message_chars > MEMORY_CONTEXT_CHAR_LIMIT:
+            break
+        kept.append({"role": message["role"], "content": message["content"]})
+        used_chars += message_chars
+    return list(reversed(kept))
+
+
+def build_memory_context(
+    chat_id: int,
+    user_id: int,
+    query: str,
+    db_path: Path | str = MEMORY_DB_PATH,
+) -> list[dict[str, str]]:
+    recent = get_recent_memory(chat_id, user_id, db_path=db_path)
+    recent_ids = {int(message["id"]) for message in recent}
+    relevant = get_relevant_memory(
+        chat_id,
+        user_id,
+        query,
+        excluded_ids=recent_ids,
+        db_path=db_path,
+    )
+
+    messages: list[dict[str, str]] = []
+    if relevant:
+        memories = "\n".join(
+            f"- {message['role']}: {message['content']}" for message in relevant
+        )
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Long-term memory from earlier conversations with this user. "
+                    "Use it when relevant, but do not mention this memory block unless asked.\n"
+                    f"{memories}"
+                ),
+            }
+        )
+    messages.extend(
+        {"role": str(message["role"]), "content": str(message["content"])}
+        for message in recent
+    )
+    return trim_memory_context(messages)
 
 
 def require_config() -> None:
@@ -86,52 +287,60 @@ async def ask_groq(messages: Sequence[dict[str, str]]) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(
-            "Hi! Send me a message and I'll answer with AI.\n\n"
-            "Commands:\n/reset — clear our conversation\n/help — show help"
+            "Hi! Send me a message and I'll answer with AI. I keep long-term memory "
+            "for this chat, so I can remember earlier conversations after restarts.\n\n"
+            "Commands:\n/reset - clear saved memory\n/memory - show saved memory count\n/help - show help"
         )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["history"] = []
-    if update.message:
-        await update.message.reply_text("Conversation cleared.")
+    if update.effective_chat and update.effective_user and update.message:
+        deleted = clear_memory(update.effective_chat.id, update.effective_user.id)
+        await update.message.reply_text(f"Memory cleared. Removed {deleted} saved messages.")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(
-            "Just send a text message. I remember the latest part of this chat. "
-            "Use /reset whenever you want a fresh conversation."
+            "Just send a text message. I save our conversation in long-term memory and "
+            "use recent plus relevant older messages when answering. "
+            "Use /memory to see how many messages are saved, or /reset to delete your saved memory."
         )
+
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat and update.effective_user and update.message:
+        saved_messages = count_memory(update.effective_chat.id, update.effective_user.id)
+        await update.message.reply_text(f"I have {saved_messages} saved messages for this chat.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
+    if not update.effective_chat or not update.effective_user:
+        return
 
     user_text = update.message.text.strip()
-    history: list[dict[str, str]] = context.user_data.setdefault("history", [])
-    history.append({"role": "user", "content": user_text})
-    history[:] = history[-MAX_HISTORY_MESSAGES:]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    save_memory(chat_id, user_id, "user", user_text)
+    messages = build_memory_context(chat_id, user_id, user_text)
 
     await update.message.chat.send_action(ChatAction.TYPING)
     try:
-        answer = await ask_groq(history)
+        answer = await ask_groq(messages)
     except httpx.HTTPStatusError as exc:
         logger.error("Groq returned HTTP %s", exc.response.status_code)
-        history.pop()
         await update.message.reply_text(
             "The AI service rejected the request. Check the API key and model, then try again."
         )
         return
     except (httpx.HTTPError, KeyError, IndexError, TypeError):
         logger.exception("Failed to get a valid response from Groq")
-        history.pop()
         await update.message.reply_text("I couldn't reach the AI service. Please try again shortly.")
         return
 
-    history.append({"role": "assistant", "content": answer})
-    history[:] = history[-MAX_HISTORY_MESSAGES:]
+    save_memory(chat_id, user_id, "assistant", answer)
     for chunk in split_message(answer):
         await update.message.reply_text(chunk)
 
@@ -142,13 +351,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     require_config()
+    init_memory_db()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    logger.info("Bot started with model %s", GROQ_MODEL)
+    logger.info("Bot started with model %s and memory database %s", GROQ_MODEL, MEMORY_DB_PATH)
     app.run_polling(drop_pending_updates=True)
 
 
